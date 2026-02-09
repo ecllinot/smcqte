@@ -93,11 +93,11 @@ public class AutoFishClient implements ClientModInitializer {
     }
     private LavaQteState lavaQteState = LavaQteState.IDLE;
     private int lavaQteWaitTimer = 0;
-    private static final int LAVA_QTE_WAIT_TIMEOUT = 60;
+    private static int lavaQteWaitTimeout = 60;  // QTE检测超时时间（tick），可在设置中调整
 
     // 设置界面
     private int selectedOption = 0;
-    private static final int TOTAL_OPTIONS = 14;
+    private static final int TOTAL_OPTIONS = 15;
     private long lastKeyPressTime = 0;
 
     // counter
@@ -654,7 +654,7 @@ public class AutoFishClient implements ClientModInitializer {
                     qteActive = true;
                     statusText = "§eQTE出现! ◆×" + diamondCount;
                     client.player.sendMessage(Text.of("§e[岩浆钓鱼] QTE出现: ◆×" + diamondCount), true);
-                } else if (lavaQteWaitTimer >= LAVA_QTE_WAIT_TIMEOUT) {
+                } else if (lavaQteWaitTimer >= lavaQteWaitTimeout) {
                     // 超时没有出现QTE，可能是误判，重新抛竿
                     lavaQteState = LavaQteState.IDLE;
                     lavaWaitingToRecast = true;
@@ -663,7 +663,7 @@ public class AutoFishClient implements ClientModInitializer {
                     statusText = "§cQTE超时，准备重新抛竿...";
                     client.player.sendMessage(Text.of("§c[岩浆钓鱼] QTE超时，重新抛竿"), true);
                 } else {
-                    double remainingSeconds = (LAVA_QTE_WAIT_TIMEOUT - lavaQteWaitTimer) / 20.0;
+                    double remainingSeconds = (lavaQteWaitTimeout - lavaQteWaitTimer) / 20.0;
                     statusText = String.format("§6等待QTE出现... %.1fs", remainingSeconds);
                 }
                 break;
@@ -1208,6 +1208,18 @@ public class AutoFishClient implements ClientModInitializer {
                 lastKeyPressTime = now;
             }
         }
+
+        // 新增：QTE检测超时时间调整
+        if (selectedOption == 14) {
+            if (InputUtil.isKeyPressed(windowHandle, GLFW.GLFW_KEY_LEFT)) {
+                lavaQteWaitTimeout = Math.max(20, lavaQteWaitTimeout - 10);
+                lastKeyPressTime = now;
+            }
+            if (InputUtil.isKeyPressed(windowHandle, GLFW.GLFW_KEY_RIGHT)) {
+                lavaQteWaitTimeout = Math.min(200, lavaQteWaitTimeout + 10);
+                lastKeyPressTime = now;
+            }
+        }
     }
 
     private String getConditionString(MinecraftClient client) {
@@ -1537,53 +1549,12 @@ public class AutoFishClient implements ClientModInitializer {
         renderInfoPanel(context, client);
     }
 
-    /**
-     * 渲染不在白名单的提示界面
-    private void renderNotWhitelistedOverlay(DrawContext context, MinecraftClient client) {
-        int screenWidth = client.getWindow().getScaledWidth();
-        int screenHeight = client.getWindow().getScaledHeight();
-
-        int panelWidth = 280;
-        int panelHeight = 80;
-        int panelX = (screenWidth - panelWidth) / 2;
-        int panelY = 10;
-        int padding = 10;
-
-        // 背景
-        context.fill(panelX, panelY, panelX + panelWidth, panelY + panelHeight, 0xE0400000);
-
-        // 边框
-        context.fill(panelX, panelY, panelX + panelWidth, panelY + 2, 0xFFFF4444);
-        context.fill(panelX, panelY + panelHeight - 2, panelX + panelWidth, panelY + panelHeight, 0xFFFF4444);
-        context.fill(panelX, panelY, panelX + 2, panelY + panelHeight, 0xFFFF4444);
-        context.fill(panelX + panelWidth - 2, panelY, panelX + panelWidth, panelY + panelHeight, 0xFFFF4444);
-
-        // 标题
-        context.drawText(client.textRenderer, "§c§l=== 自动钓鱼 - 访问被拒绝 ===",
-                panelX + padding, panelY + padding, 0xFFFFFFFF, true);
-
-        // 消息
-        context.drawText(client.textRenderer, whitelistMessage,
-                panelX + padding, panelY + padding + 15, 0xFFFFFFFF, true);
-
-        // 玩家信息
-        context.drawText(client.textRenderer, "§7玩家: §f" + playerName,
-                panelX + padding, panelY + padding + 30, 0xFFAAAAAA, true);
-
-        context.drawText(client.textRenderer, "§7UUID: §f" + (playerUUID.length() > 20 ? playerUUID.substring(0, 20) + "..." : playerUUID),
-                panelX + padding, panelY + padding + 42, 0xFFAAAAAA, true);
-
-        context.drawText(client.textRenderer, "§7请联系管理员获取白名单权限",
-                panelX + padding, panelY + padding + 56, 0xFFAAAAAA, true);
-    }
-    */
-
     private void renderSettingsPanel(DrawContext context, MinecraftClient client) {
         int screenWidth = client.getWindow().getScaledWidth();
         int screenHeight = client.getWindow().getScaledHeight();
 
         int panelWidth = 320;
-        int panelHeight = 360;
+        int panelHeight = 380;
         int panelX = (screenWidth - panelWidth) / 2;
         int panelY = (screenHeight - panelHeight) / 2;
         int lineHeight = 18;
@@ -1611,10 +1582,11 @@ public class AutoFishClient implements ClientModInitializer {
                 (selectedOption == 8 ? "§e> " : "  ") + "药水阈值: §6" + luckPotionThreshold + "s §7(←→调整)",
                 (selectedOption == 9 ? "§e> " : "  ") + "切换延迟: §6" + itemSwitchDelay + " tick §7(←→调整)",
                 "§6--- 岩浆钓鱼设置 ---",
-                (selectedOption == 10 ? "§e> " : "  ") + "岩浆钓鱼模式: " + (lavaFishingMode ? "§a开" : "§c关") + " §7[M键]",
+                (selectedOption == 10 ? "§e> " : "  ") + "岩浆钓鱼模式: " + (lavaFishingMode ? "§a开" : "§c关"),
                 (selectedOption == 11 ? "§e> " : "  ") + "浮标稳定时间: §6" + String.format("%.1fs", lavaSettleTime / 20.0) + " §7(←→调整)",
                 (selectedOption == 12 ? "§e> " : "  ") + "重新抛竿延迟: §6" + String.format("%.1fs", lavaRecastDelay / 20.0) + " §7(←→调整)",
-                (selectedOption == 13 ? "§e> " : "  ") + "浮标上浮阈值: §6" + String.format("%.3f", lavaBobberRiseThreshold) + " §7(←→调整)"
+                (selectedOption == 13 ? "§e> " : "  ") + "浮标上浮阈值: §6" + String.format("%.3f", lavaBobberRiseThreshold) + " §7(←→调整)",
+                (selectedOption == 14 ? "§e> " : "  ") + "QTE检测超时: §6" + String.format("%.1fs", lavaQteWaitTimeout / 20.0) + " §7(←→调整)"
         };
 
         for (int i = 0; i < options.length; i++) {
@@ -1672,7 +1644,7 @@ public class AutoFishClient implements ClientModInitializer {
                     }
                     break;
                 case WAITING_FOR_QTE:
-                    double remaining = (LAVA_QTE_WAIT_TIMEOUT - lavaQteWaitTimer) / 20.0;
+                    double remaining = (lavaQteWaitTimeout - lavaQteWaitTimer) / 20.0;
                     lavaStatusStr = "§6等待QTE " + String.format("%.1fs", remaining);
                     break;
                 case QTE_ACTIVE:
