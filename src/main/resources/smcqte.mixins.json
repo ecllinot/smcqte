@@ -2,12 +2,12 @@
 	"required": true,
 	"package": "net.smc.qte.mixin",
 	"compatibilityLevel": "JAVA_21",
-	"mixins": [
-		"ExampleMixin"
-	],
+	"mixins": [],
 	"client": [
+		"InGameHudCaptureMixin",
 		"InGameHudAccessor",
-		"PlayerInventoryAccessor"
+		"PlayerInventoryAccessor",
+		"SoundSystemCaptureMixin"
 	],
 	"injectors": {
 		"defaultRequire": 1

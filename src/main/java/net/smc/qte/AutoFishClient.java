@@ -1,4 +1,4 @@
-﻿package net.smc.qte;
+package net.smc.qte;
 
 import net.smc.qte.mixin.PlayerInventoryAccessor;
 import net.minecraft.network.packet.c2s.play.UpdateSelectedSlotC2SPacket;
@@ -23,7 +23,6 @@ import net.minecraft.item.Items;
 import net.minecraft.potion.Potions;
 import net.minecraft.screen.slot.SlotActionType;
 import net.minecraft.text.Text;
-import net.minecraft.util.Hand;
 import net.minecraft.util.Identifier;
 import net.smc.qte.mixin.InGameHudAccessor;
 import org.lwjgl.glfw.GLFW;
@@ -39,6 +38,7 @@ import java.time.Duration;
 import java.util.ArrayDeque;
 import java.util.Deque;
 import java.util.concurrent.CompletableFuture;
+import java.util.regex.Pattern;
 
 public class AutoFishClient implements ClientModInitializer {
 
@@ -118,13 +118,37 @@ public class AutoFishClient implements ClientModInitializer {
     private static final char UP_ARROW_CHAR = '\u2191';
     private static final char DOWN_ARROW_CHAR = '\u2193';
     private static final int CLICK_QTE_TICK_INTERVAL = 2;
-    private static final int ARROW_QTE_TICK_INTERVAL = 40;
+    private static final int ARROW_QTE_TICK_INTERVAL = 12;
     private static final int JUMP_KEY_HOLD_TICKS = 3;
     private static final int SNEAK_KEY_HOLD_TICKS = 10;
+    private static final long HUD_TEXT_FRESH_MS = 3000;
+    private static final long SOUND_FRESH_MS = 1800;
+    private static final long BALANCE_BAR_FRESH_MS = 1200;
+    private static final Pattern MINECRAFT_FORMATTING_PATTERN = Pattern.compile("§[0-9A-FK-ORa-fk-or]");
+    private static final char BALANCE_BAR_START_CHAR = '뀌';
+    private static final char BALANCE_GREEN_START_CHAR = '뀒';
+    private static final char BALANCE_POINTER_CHAR = '뀁';
+    private static final int BALANCE_GREEN_WIDTH = 45;
+    private static final int BALANCE_TOLERANCE = 5;
+    private static final int BALANCE_START_POSITION = 256;
+    private static final long BALANCE_FALLBACK_REEL_COOLDOWN_MS = 500;
+    private static final String[] BALANCE_FALLBACK_SYMBOLS = {"💰", "♦", "💎", "⭐", "◈", "◆", "◇", "●", "○"};
+    private static final int[] BALANCE_WIDTH_OFFSETS = new int[63520];
+
+    private static volatile String capturedTitleText = "";
+    private static volatile String capturedSubtitleText = "";
+    private static volatile String capturedActionbarText = "";
+    private static volatile long capturedTitleAt = 0L;
+    private static volatile long capturedSubtitleAt = 0L;
+    private static volatile long capturedActionbarAt = 0L;
+    private static volatile Identifier lastSoundId = null;
+    private static volatile long lastSoundAt = 0L;
+    private static volatile BalanceBarSnapshot latestBalanceBar = BalanceBarSnapshot.EMPTY;
+    private static volatile long latestBalanceBarAt = 0L;
 
     private enum QteMode {
         NONE,
-        FISH_BAR,
+        VISUAL_BALANCE_BAR,
         CLICK_SPAM,
         ARROW_SEQUENCE
     }
@@ -135,10 +159,37 @@ public class AutoFishClient implements ClientModInitializer {
         UNKNOWN
     }
 
+    private record BalanceBarSnapshot(int greenStart, int greenEnd, int pointer, boolean valid) {
+        private static final BalanceBarSnapshot EMPTY = new BalanceBarSnapshot(0, 0, 0, false);
+    }
+
+    static {
+        BALANCE_WIDTH_OFFSETS[0xF801] = -3;
+        BALANCE_WIDTH_OFFSETS[0xF802] = -4;
+        BALANCE_WIDTH_OFFSETS[0xF803] = -6;
+        BALANCE_WIDTH_OFFSETS[0xF804] = -10;
+        BALANCE_WIDTH_OFFSETS[0xF805] = -18;
+        BALANCE_WIDTH_OFFSETS[0xF806] = -34;
+        BALANCE_WIDTH_OFFSETS[0xF807] = -66;
+        BALANCE_WIDTH_OFFSETS[0xF808] = -130;
+        BALANCE_WIDTH_OFFSETS[0xF811] = -1;
+        BALANCE_WIDTH_OFFSETS[0xF812] = 1;
+        BALANCE_WIDTH_OFFSETS[0xF813] = 3;
+        BALANCE_WIDTH_OFFSETS[0xF814] = 7;
+        BALANCE_WIDTH_OFFSETS[0xF815] = 15;
+        BALANCE_WIDTH_OFFSETS[0xF816] = 31;
+        BALANCE_WIDTH_OFFSETS[0xF817] = 63;
+        BALANCE_WIDTH_OFFSETS[0xF818] = 127;
+    }
+
     private QteMode activeQteMode = QteMode.NONE;
     private int qteTickCounter = 0;
-    private int fishInitialProgress = 0;
-    private int fishLastProgress = 0;
+    private BalanceBarSnapshot activeBalanceBar = BalanceBarSnapshot.EMPTY;
+    private boolean balanceFallbackActive = false;
+    private boolean balanceFallbackTriggered = false;
+    private String balanceFallbackSymbol = "";
+    private int balanceFallbackBaseline = 0;
+    private long lastBalanceFallbackReelTime = 0L;
     private final Deque<Character> arrowQueue = new ArrayDeque<>();
     private ClickQteAction clickQteAction = ClickQteAction.LEFT;
     private int jumpKeyPressedTicks = 0;
@@ -147,6 +198,7 @@ public class AutoFishClient implements ClientModInitializer {
     private int lastDiamondCount = 0;
     private int currentDiamondCount = 0;
     private boolean qteActive = false;
+    private String lastArrowPrompt = "";
 
     // ===== 幸运药水配置 =====
     private static boolean autoUseLuckPotion = true;
@@ -407,6 +459,87 @@ public class AutoFishClient implements ClientModInitializer {
                 handleNormalFishing(client, rodCast);
             }
         });
+    }
+
+    public static void captureHudTitle(Text text) {
+        String value = textToString(text);
+        if (!value.isEmpty()) {
+            capturedTitleText = value;
+            capturedTitleAt = System.currentTimeMillis();
+        }
+    }
+
+    public static void captureHudSubtitle(Text text) {
+        String value = textToString(text);
+        if (!value.isEmpty()) {
+            capturedSubtitleText = value;
+            capturedSubtitleAt = System.currentTimeMillis();
+            captureBalanceBar(value);
+        }
+    }
+
+    public static void captureHudActionbar(Text text) {
+        String value = textToString(text);
+        if (!value.isEmpty()) {
+            capturedActionbarText = value;
+            capturedActionbarAt = System.currentTimeMillis();
+        }
+    }
+
+    public static void captureSound(Identifier soundId) {
+        if (soundId != null) {
+            lastSoundId = soundId;
+            lastSoundAt = System.currentTimeMillis();
+        }
+    }
+
+    private static String textToString(Text text) {
+        if (text == null) return "";
+        String value = text.getString();
+        return value == null ? "" : value;
+    }
+
+    private static void captureBalanceBar(String text) {
+        BalanceBarSnapshot snapshot = parseBalanceBar(text);
+        if (snapshot.valid()) {
+            latestBalanceBar = snapshot;
+            latestBalanceBarAt = System.currentTimeMillis();
+        }
+    }
+
+    private static BalanceBarSnapshot parseBalanceBar(String text) {
+        if (text == null || text.isEmpty()) {
+            return BalanceBarSnapshot.EMPTY;
+        }
+
+        int position = 0;
+        int greenStart = -1;
+        int pointer = -1;
+        boolean started = false;
+
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c == BALANCE_BAR_START_CHAR) {
+                started = true;
+                position = BALANCE_START_POSITION;
+            } else if (c == BALANCE_GREEN_START_CHAR) {
+                if (started) {
+                    greenStart = position;
+                    position += BALANCE_GREEN_WIDTH;
+                }
+            } else if (c == BALANCE_POINTER_CHAR) {
+                if (started) {
+                    pointer = position;
+                }
+            } else if (c >= 0xF801 && c < BALANCE_WIDTH_OFFSETS.length) {
+                position += BALANCE_WIDTH_OFFSETS[c];
+            }
+        }
+
+        if (greenStart >= 0 && pointer >= 0) {
+            return new BalanceBarSnapshot(greenStart, greenStart + BALANCE_GREEN_WIDTH, pointer, true);
+        }
+        return BalanceBarSnapshot.EMPTY;
     }
 
     // ===== 白名单验证相关方法 =====
@@ -775,6 +908,12 @@ public class AutoFishClient implements ClientModInitializer {
             return false;
         }
 
+        if (hasFreshFishingSound()) {
+            lastSoundAt = 0L;
+            statusText = "§a检测到咬钩音效！";
+            return true;
+        }
+
         if (deltaY > lavaBobberRiseThreshold) {
             riseTickCount++;
             statusText = "§e检测到浮动: " + String.format("%.4f", deltaY) + " (计数: " + riseTickCount + ")";
@@ -859,7 +998,7 @@ public class AutoFishClient implements ClientModInitializer {
     private void updateQteTrackingFromText(MinecraftClient client, String titleText) {
         if (titleText == null) return;
 
-        String normalized = normalizeQteText(titleText);
+        String normalized = normalizeQteText(mergeFreshHudText(titleText));
         if (normalized.isEmpty()) return;
 
         lastDiamondCount = currentDiamondCount;
@@ -874,8 +1013,8 @@ public class AutoFishClient implements ClientModInitializer {
         }
 
         switch (activeQteMode) {
-            case FISH_BAR:
-                handleFishBarQte(client, normalized);
+            case VISUAL_BALANCE_BAR:
+                handleVisualBalanceBarQte(client, normalized);
                 break;
             case CLICK_SPAM:
                 handleClickSpamQte(client);
@@ -892,7 +1031,8 @@ public class AutoFishClient implements ClientModInitializer {
     private void beginQteMode(MinecraftClient client, String normalizedText) {
         if (hasArrowPrompt(normalizedText)) {
             arrowQueue.clear();
-        clickQteAction = ClickQteAction.LEFT;
+            clickQteAction = ClickQteAction.LEFT;
+            lastArrowPrompt = normalizedText;
             for (int i = 0; i < normalizedText.length(); i++) {
                 char c = normalizedText.charAt(i);
                 if (c == LEFT_ARROW_CHAR || c == RIGHT_ARROW_CHAR
@@ -903,10 +1043,30 @@ public class AutoFishClient implements ClientModInitializer {
             if (!arrowQueue.isEmpty()) {
                 activeQteMode = QteMode.ARROW_SEQUENCE;
                 qteActive = true;
-                qteTickCounter = 0;
+                qteTickCounter = ARROW_QTE_TICK_INTERVAL;
                 statusText = "§e方向QTE: " + arrowQueue.size() + "步";
                 return;
             }
+        }
+
+        if (isVisualBalanceStartPrompt(normalizedText) || (hasFreshBalanceBar() && isVisualBalanceStartPrompt(getFreshHudText(capturedTitleText, capturedTitleAt)))) {
+            activeQteMode = QteMode.VISUAL_BALANCE_BAR;
+            qteActive = true;
+            qteTickCounter = 0;
+            activeBalanceBar = getFreshBalanceBar();
+            startBalanceCharacterFallbackIfPresent(normalizedText);
+            doLeftClick(client);
+            lastClickTime = System.currentTimeMillis();
+            statusText = "§e平衡条QTE: 点击左键启动";
+            return;
+        }
+
+        if (startBalanceCharacterFallbackIfPresent(normalizedText)) {
+            activeQteMode = QteMode.VISUAL_BALANCE_BAR;
+            qteActive = true;
+            qteTickCounter = 0;
+            statusText = "§e平衡条QTE(字符): 基准 '" + balanceFallbackSymbol + "' ×" + balanceFallbackBaseline;
+            return;
         }
 
         if (isClickQtePrompt(normalizedText)) {
@@ -915,36 +1075,75 @@ public class AutoFishClient implements ClientModInitializer {
             qteTickCounter = 0;
             updateClickQteActionFromPrompt(client);
             statusText = clickQteAction == ClickQteAction.RIGHT ? "§e连点QTE(右键)..." : "§e连点QTE(左键)...";
-            return;
-        }
-
-        int symbolCount = countFishProgressSymbols(normalizedText);
-        if (symbolCount > 0) {
-            activeQteMode = QteMode.FISH_BAR;
-            qteActive = true;
-            fishInitialProgress = symbolCount;
-            fishLastProgress = symbolCount;
-            statusText = "§e鱼条QTE: " + symbolCount;
         }
     }
 
-    private void handleFishBarQte(MinecraftClient client, String normalizedText) {
-        int symbolCount = countFishProgressSymbols(normalizedText);
-        if (symbolCount <= 0) {
+    private void handleVisualBalanceBarQte(MinecraftClient client, String normalizedText) {
+        if (updateBalanceCharacterFallback(client, normalizedText)) {
             return;
         }
 
-        fishLastProgress = symbolCount;
-        statusText = "§e鱼条QTE: " + symbolCount + " / " + fishInitialProgress;
-
-        if (symbolCount < fishInitialProgress) {
+        BalanceBarSnapshot snapshot = getFreshBalanceBar();
+        if (!snapshot.valid()) {
             long now = System.currentTimeMillis();
-            if (now - lastClickTime > 250) {
-                doRightClick(client);
+            if (now - lastClickTime >= 150) {
+                KeySim.clickLeftRapid(client);
                 lastClickTime = now;
-                statusText = "§a[收杆] 进度减少: " + fishInitialProgress + " -> " + symbolCount;
+                statusText = "§e平衡条QTE: 等待subtitle定位，盲点左键";
+            }
+            return;
+        }
+
+        activeBalanceBar = snapshot;
+        long now = System.currentTimeMillis();
+        if (now - lastClickTime < 80) {
+            return;
+        }
+
+        if (snapshot.pointer() < snapshot.greenStart() - BALANCE_TOLERANCE) {
+            KeySim.holdLeft(client);
+            doLeftClick(client);
+            lastClickTime = now;
+            statusText = "§e平衡条QTE: 指针" + snapshot.pointer() + " 在绿区" + snapshot.greenStart() + "-" + snapshot.greenEnd() + "左侧，点击左键右移";
+        } else {
+            releaseAttackKey(client);
+            if (snapshot.pointer() > snapshot.greenEnd() + BALANCE_TOLERANCE) {
+                statusText = "§e平衡条QTE: 指针" + snapshot.pointer() + " 在绿区右侧，松开左移";
+            } else {
+                statusText = "§a平衡条QTE: 指针在绿区内，保持";
             }
         }
+    }
+
+    private boolean updateBalanceCharacterFallback(MinecraftClient client, String normalizedText) {
+        if (!balanceFallbackActive) {
+            return false;
+        }
+
+        int currentCount = countSymbol(normalizedText, balanceFallbackSymbol);
+        if (currentCount <= 0) {
+            return false;
+        }
+
+        if (currentCount > balanceFallbackBaseline) {
+            long now = System.currentTimeMillis();
+            if (now - lastBalanceFallbackReelTime >= BALANCE_FALLBACK_REEL_COOLDOWN_MS) {
+                KeySim.clickRight(client);
+                lastBalanceFallbackReelTime = now;
+                balanceFallbackTriggered = true;
+                statusText = "§a平衡条QTE(字符): '" + balanceFallbackSymbol + "' ×"
+                        + balanceFallbackBaseline + " -> " + currentCount + "，收杆";
+            }
+            return true;
+        }
+
+        if (currentCount < balanceFallbackBaseline) {
+            balanceFallbackBaseline = currentCount;
+            statusText = "§e平衡条QTE(字符): 更新基准 '" + balanceFallbackSymbol + "' ×" + balanceFallbackBaseline;
+            return true;
+        }
+
+        return false;
     }
 
     private void handleClickSpamQte(MinecraftClient client) {
@@ -953,9 +1152,9 @@ public class AutoFishClient implements ClientModInitializer {
         if (qteTickCounter >= CLICK_QTE_TICK_INTERVAL) {
             qteTickCounter = 0;
             if (clickQteAction == ClickQteAction.RIGHT) {
-                doRightClick(client);
+                KeySim.clickRightRapid(client);
             } else {
-                doLeftClick(client);
+                KeySim.clickLeftRapid(client);
             }
         }
     }
@@ -1023,15 +1222,33 @@ public class AutoFishClient implements ClientModInitializer {
         }
     }
 
+    private void releaseAttackKey(MinecraftClient client) {
+        KeySim.releaseLeft(client);
+    }
+
+    private boolean startBalanceCharacterFallbackIfPresent(String normalizedText) {
+        String fallbackSymbol = findBalanceFallbackSymbol(normalizedText);
+        if (fallbackSymbol.isEmpty()) {
+            return false;
+        }
+
+        balanceFallbackActive = true;
+        balanceFallbackTriggered = false;
+        balanceFallbackSymbol = fallbackSymbol;
+        balanceFallbackBaseline = countSymbol(normalizedText, fallbackSymbol);
+        lastBalanceFallbackReelTime = 0L;
+        return true;
+    }
+
     private boolean didQteSucceed(MinecraftClient client, String text) {
-        String normalized = normalizeQteText(text);
+        String normalized = normalizeQteText(mergeFreshHudText(text));
         if (normalized.isEmpty()) {
             return false;
         }
 
         switch (activeQteMode) {
-            case FISH_BAR:
-                return fishLastProgress > 0 && fishLastProgress < fishInitialProgress;
+            case VISUAL_BALANCE_BAR:
+                return balanceFallbackTriggered || isQteSuccessText(normalized);
             case CLICK_SPAM:
                 if (isQteSuccessText(normalized)) {
                     doRightClick(client);
@@ -1054,18 +1271,30 @@ public class AutoFishClient implements ClientModInitializer {
         if (!qteActive) {
             return false;
         }
-        return isQteFailText(normalizeQteText(text));
+        return isQteFailText(normalizeQteText(mergeFreshHudText(text)));
     }
 
     private boolean isAnyQtePrompt(String text) {
         if (text == null || text.isEmpty()) return false;
         String normalized = normalizeQteText(text);
-        return hasArrowPrompt(normalized) || isClickQtePrompt(normalized) || countFishProgressSymbols(normalized) > 0;
+        return hasArrowPrompt(normalized)
+                || isVisualBalanceStartPrompt(normalized)
+                || (hasFreshBalanceBar() && isVisualBalanceStartPrompt(getFreshHudText(capturedTitleText, capturedTitleAt)))
+                || isClickQtePrompt(normalized);
     }
 
     private String normalizeQteText(String text) {
         if (text == null) return "";
-        return text.replaceAll("\\s+", "");
+        String normalized = MINECRAFT_FORMATTING_PATTERN.matcher(text).replaceAll("");
+        normalized = normalized
+                .replace('（', '(')
+                .replace('）', ')')
+                .replace('，', ',')
+                .replace('：', ':')
+                .replace('＋', '+')
+                .replace('－', '-')
+                .replace('　', ' ');
+        return normalized.replaceAll("\\s+", "");
     }
 
     private boolean hasArrowPrompt(String text) {
@@ -1073,12 +1302,66 @@ public class AutoFishClient implements ClientModInitializer {
                 || text.indexOf(UP_ARROW_CHAR) >= 0 || text.indexOf(DOWN_ARROW_CHAR) >= 0;
     }
 
+    private boolean isVisualBalanceStartPrompt(String text) {
+        if (text == null || text.isEmpty()) return false;
+        String normalized = normalizeQteText(text);
+        String lower = normalized.toLowerCase();
+        return (normalized.contains("点击") || normalized.contains("點擊") || lower.contains("click"))
+                && (normalized.contains("开始") || normalized.contains("開始") || lower.contains("start"));
+    }
+
+    private String findBalanceFallbackSymbol(String text) {
+        if (text == null || text.isEmpty()) return "";
+
+        String bestSymbol = "";
+        int bestCount = 0;
+        for (String symbol : BALANCE_FALLBACK_SYMBOLS) {
+            int count = countSymbol(text, symbol);
+            if (count > bestCount) {
+                bestSymbol = symbol;
+                bestCount = count;
+            }
+        }
+        return bestCount > 0 ? bestSymbol : "";
+    }
+
+    private int countSymbol(String text, String symbol) {
+        if (text == null || text.isEmpty() || symbol == null || symbol.isEmpty()) return 0;
+
+        int count = 0;
+        int fromIndex = 0;
+        while (fromIndex < text.length()) {
+            int index = text.indexOf(symbol, fromIndex);
+            if (index < 0) break;
+            count++;
+            fromIndex = index + symbol.length();
+        }
+        return count;
+    }
+
     private boolean isClickQtePrompt(String text) {
-        return text.contains("需要点击次数") || (text.contains("点击") && text.contains("次"));
+        String normalized = normalizeQteText(text).toLowerCase();
+        if (isVisualBalanceStartPrompt(normalized)) return false;
+        return normalized.contains("需要点击次数")
+                || normalized.contains("需点击次数")
+                || normalized.contains("点击次数")
+                || normalized.contains("連點")
+                || normalized.contains("连点")
+                || normalized.contains("點擊")
+                || (normalized.contains("点击") && normalized.contains("次"))
+                || (normalized.contains("click") && (normalized.contains("times") || normalized.contains("time")))
+                || normalized.contains("spamclick")
+                || normalized.contains("rapidclick");
     }
 
     private void updateClickQteActionFromPrompt(MinecraftClient client) {
-        ClickQteAction action = detectClickQteAction(getCurrentSubtitleText(client));
+        ClickQteAction action = detectClickQteAction(getFreshHudText(capturedSubtitleText, capturedSubtitleAt));
+        if (action == ClickQteAction.UNKNOWN) {
+            action = detectClickQteAction(getFreshHudText(capturedActionbarText, capturedActionbarAt));
+        }
+        if (action == ClickQteAction.UNKNOWN) {
+            action = detectClickQteAction(getCurrentSubtitleText(client));
+        }
         if (action == ClickQteAction.UNKNOWN) {
             action = detectClickQteAction(getCurrentTitleText(client));
         }
@@ -1092,32 +1375,48 @@ public class AutoFishClient implements ClientModInitializer {
         if (normalized.isEmpty()) {
             return ClickQteAction.UNKNOWN;
         }
-        if (normalized.contains("\\u53f3") || normalized.contains("\\u53f3\\u952e") || normalized.contains("right") || normalized.contains("mouse2") || normalized.contains("rmb")) {
+        if (normalized.contains("右") || normalized.contains("右键") || normalized.contains("右鍵")
+                || normalized.contains("使用") || normalized.contains("收杆") || normalized.contains("收竿")
+                || normalized.contains("use") || normalized.contains("right") || normalized.contains("mouse2")
+                || normalized.contains("button2") || normalized.contains("rmb")) {
             return ClickQteAction.RIGHT;
         }
-        if (normalized.contains("\\u5de6") || normalized.contains("\\u5de6\\u952e") || normalized.contains("left") || normalized.contains("mouse1") || normalized.contains("lmb")) {
+        if (normalized.contains("左") || normalized.contains("左键") || normalized.contains("左鍵")
+                || normalized.contains("攻击") || normalized.contains("攻擊") || normalized.contains("挥杆")
+                || normalized.contains("attack") || normalized.contains("left") || normalized.contains("mouse1")
+                || normalized.contains("button1") || normalized.contains("lmb")) {
             return ClickQteAction.LEFT;
         }
         return ClickQteAction.UNKNOWN;
     }
 
     private boolean isQteSuccessText(String text) {
-        return text.contains("成功") || text.contains("完成") || text.contains("收杆") || text.contains("钓上") || text.contains("钓到");
+        String normalized = normalizeQteText(text).toLowerCase();
+        return normalized.contains("成功")
+                || normalized.contains("完成")
+                || normalized.contains("收杆")
+                || normalized.contains("收竿")
+                || normalized.contains("钓上")
+                || normalized.contains("釣上")
+                || normalized.contains("钓到")
+                || normalized.contains("釣到")
+                || normalized.contains("success")
+                || normalized.contains("complete");
     }
 
     private boolean isQteFailText(String text) {
-        return text.contains("再试") || text.contains("遗憾") || text.contains("失败") || text.contains("超时") || text.contains("结束");
-    }
-    private int countFishProgressSymbols(String text) {
-        if (text == null || text.isEmpty()) return 0;
-        int count = 0;
-        for (int i = 0; i < text.length(); i++) {
-            char c = text.charAt(i);
-            if (c == '◈' || c == '◆' || c == '♦' || c == '◇' || c == '●' || c == '○') {
-                count++;
-            }
-        }
-        return count;
+        String normalized = normalizeQteText(text).toLowerCase();
+        return normalized.contains("再试")
+                || normalized.contains("再試")
+                || normalized.contains("遗憾")
+                || normalized.contains("遺憾")
+                || normalized.contains("失败")
+                || normalized.contains("失敗")
+                || normalized.contains("超时")
+                || normalized.contains("超時")
+                || normalized.contains("timeout")
+                || normalized.contains("failed")
+                || normalized.contains("fail");
     }
     private void resetQteModeState() {
         lastDiamondCount = 0;
@@ -1125,14 +1424,22 @@ public class AutoFishClient implements ClientModInitializer {
         qteActive = false;
         activeQteMode = QteMode.NONE;
         qteTickCounter = 0;
-        fishInitialProgress = 0;
-        fishLastProgress = 0;
         arrowQueue.clear();
         clickQteAction = ClickQteAction.LEFT;
+        lastArrowPrompt = "";
+        activeBalanceBar = BalanceBarSnapshot.EMPTY;
+        balanceFallbackActive = false;
+        balanceFallbackTriggered = false;
+        balanceFallbackSymbol = "";
+        balanceFallbackBaseline = 0;
+        lastBalanceFallbackReelTime = 0L;
+        releaseAttackKey(MinecraftClient.getInstance());
         releaseMovementKeys(MinecraftClient.getInstance());
     }
 
     private String getCurrentSubtitleText(MinecraftClient client) {
+        String captured = getFreshHudText(capturedSubtitleText, capturedSubtitleAt);
+        if (!captured.isEmpty()) return captured;
         if (client.inGameHud == null) return null;
 
         try {
@@ -1152,6 +1459,8 @@ public class AutoFishClient implements ClientModInitializer {
     }
 
     private String getCurrentTitleText(MinecraftClient client) {
+        String captured = getBestFreshHudText();
+        if (!captured.isEmpty()) return captured;
         if (client.inGameHud == null) return null;
 
         try {
@@ -1177,6 +1486,61 @@ public class AutoFishClient implements ClientModInitializer {
         }
 
         return null;
+    }
+
+    private String getBestFreshHudText() {
+        String title = getFreshHudText(capturedTitleText, capturedTitleAt);
+        String actionbar = getFreshHudText(capturedActionbarText, capturedActionbarAt);
+        String subtitle = getFreshHudText(capturedSubtitleText, capturedSubtitleAt);
+
+        if (!title.isEmpty() && isAnyQtePrompt(title)) return title;
+        if (!actionbar.isEmpty() && isAnyQtePrompt(actionbar)) return actionbar;
+        if (!subtitle.isEmpty() && isAnyQtePrompt(subtitle)) return subtitle;
+        if (!title.isEmpty()) return title;
+        if (!actionbar.isEmpty()) return actionbar;
+        return subtitle;
+    }
+
+    private String mergeFreshHudText(String text) {
+        StringBuilder builder = new StringBuilder();
+        appendFreshHudText(builder, text);
+        appendFreshHudText(builder, getFreshHudText(capturedTitleText, capturedTitleAt));
+        appendFreshHudText(builder, getFreshHudText(capturedSubtitleText, capturedSubtitleAt));
+        appendFreshHudText(builder, getFreshHudText(capturedActionbarText, capturedActionbarAt));
+        return builder.toString();
+    }
+
+    private void appendFreshHudText(StringBuilder builder, String text) {
+        if (text == null || text.isEmpty()) return;
+        if (builder.indexOf(text) >= 0) return;
+        if (builder.length() > 0) builder.append(' ');
+        builder.append(text);
+    }
+
+    private String getFreshHudText(String text, long capturedAt) {
+        if (text == null || text.isEmpty()) return "";
+        return System.currentTimeMillis() - capturedAt <= HUD_TEXT_FRESH_MS ? text : "";
+    }
+
+    private BalanceBarSnapshot getFreshBalanceBar() {
+        return hasFreshBalanceBar() ? latestBalanceBar : BalanceBarSnapshot.EMPTY;
+    }
+
+    private boolean hasFreshBalanceBar() {
+        return latestBalanceBar.valid()
+                && System.currentTimeMillis() - latestBalanceBarAt <= BALANCE_BAR_FRESH_MS;
+    }
+
+    private boolean hasFreshFishingSound() {
+        if (lastSoundId == null) return false;
+        if (System.currentTimeMillis() - lastSoundAt > SOUND_FRESH_MS) return false;
+
+        String sound = lastSoundId.toString().toLowerCase();
+        return sound.contains("entity.fishing_bobber")
+                || sound.contains("entity.generic.splash")
+                || sound.contains("item.trident")
+                || sound.contains("entity.lightning_bolt")
+                || sound.contains("block.lava");
     }
     private int countDiamonds(String text) {
         if (text == null) return 0;
@@ -1526,27 +1890,11 @@ public class AutoFishClient implements ClientModInitializer {
     }
 
     private void doRightClick(MinecraftClient client) {
-        if (client == null) return;
-        if (client.interactionManager != null && client.player != null) {
-            client.interactionManager.interactItem(client.player, Hand.MAIN_HAND);
-            client.player.swingHand(Hand.MAIN_HAND);
-        }
+        KeySim.clickRight(client);
     }
 
     private void doLeftClick(MinecraftClient client) {
-        if (client == null) return;
-        if (client.interactionManager != null && client.player != null) {
-            try {
-                java.lang.reflect.Method m = MinecraftClient.class.getDeclaredMethod("doAttack");
-                m.setAccessible(true);
-                m.invoke(client);
-            } catch (Exception ignored) {
-                // fallback: 直接触发攻击键，尽量兼容不同映射
-                client.options.attackKey.setPressed(true);
-                client.options.attackKey.setPressed(false);
-            }
-            client.player.swingHand(Hand.MAIN_HAND);
-        }
+        KeySim.clickLeft(client);
     }
 
     private boolean hasLuckEffect(MinecraftClient client) {
@@ -1961,12 +2309,29 @@ public class AutoFishClient implements ClientModInitializer {
 
         // 白名单状态
         String whitelistStatus = isWhitelisted ? "§a已验证" : (whitelistCheckInProgress ? "§e验证中..." : "§c未通过");
+        String hudText = trimDebugText(normalizeQteText(getBestFreshHudText()), 32);
+        String soundText = lastSoundId != null && System.currentTimeMillis() - lastSoundAt <= SOUND_FRESH_MS
+                ? trimDebugText(lastSoundId.toString(), 36)
+                : "§7无";
+        BalanceBarSnapshot debugBar = getFreshBalanceBar();
+        String balanceText = debugBar.valid()
+                ? "§fG=" + debugBar.greenStart() + "-" + debugBar.greenEnd() + " P=" + debugBar.pointer()
+                : "§7无";
+        String balanceFallbackText = balanceFallbackActive
+                ? "§f'" + balanceFallbackSymbol + "' ×" + balanceFallbackBaseline
+                + (balanceFallbackTriggered ? " §a已收杆" : "")
+                : "§7无";
 
         String[] lines = {
                 "§b=== 自动钓鱼QTE ===",
                 "白名单: " + whitelistStatus + " §7(" + playerName + ")",
                 "状态: " + (isRunning ? "§a运行中" : "§c已停止"),
                 "检测模式: " + (lavaFishingMode ? "§6岩浆钓鱼+QTE" : "§e◆ QTE"),
+                "QTE模式: §e" + activeQteMode.name() + " §7" + diamondInfo,
+                "HUD捕捉: §f" + (hudText.isEmpty() ? "§7无" : hudText),
+                "最近音效: §f" + soundText,
+                "平衡条: " + balanceText,
+                "字符fallback: " + balanceFallbackText,
                 lavaFishingMode ? "岩浆状态: " + lavaStatusStr : "",
                 "鱼竿: " + getRodStateString(client),
                 "耐久: " + durabilityInfo,
@@ -1999,6 +2364,10 @@ public class AutoFishClient implements ClientModInitializer {
                     panelX + padding, panelY + padding + i * lineHeight, 0xFFFFFFFF, true);
         }
     }
+
+    private String trimDebugText(String text, int maxLength) {
+        if (text == null) return "";
+        if (text.length() <= maxLength) return text;
+        return text.substring(0, Math.max(0, maxLength - 3)) + "...";
+    }
 }
-
-
