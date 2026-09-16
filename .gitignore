@@ -1,0 +1,15 @@
+﻿# Gradle
+.gradle/
+build/
+
+# IDE
+.idea/
+*.iml
+
+# Runtime files
+run/
+
+# Local temp/work dirs
+.gradle-user/
+.gradle-user-home/
+restore_src/
