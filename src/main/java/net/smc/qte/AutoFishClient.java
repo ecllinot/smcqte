@@ -1,4 +1,4 @@
-package net.smc.qte;
+﻿package net.smc.qte;
 
 import net.smc.qte.mixin.PlayerInventoryAccessor;
 import net.minecraft.network.packet.c2s.play.UpdateSelectedSlotC2SPacket;
@@ -24,6 +24,7 @@ import net.minecraft.potion.Potions;
 import net.minecraft.screen.slot.SlotActionType;
 import net.minecraft.text.Text;
 import net.minecraft.util.Hand;
+import net.minecraft.util.Identifier;
 import net.smc.qte.mixin.InGameHudAccessor;
 import org.lwjgl.glfw.GLFW;
 
@@ -35,6 +36,8 @@ import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
 import java.time.Duration;
+import java.util.ArrayDeque;
+import java.util.Deque;
 import java.util.concurrent.CompletableFuture;
 
 public class AutoFishClient implements ClientModInitializer {
@@ -44,13 +47,14 @@ public class AutoFishClient implements ClientModInitializer {
     private static KeyBinding settingsKey;
     private static KeyBinding toggleLuckPotionKey;
     private static KeyBinding toggleLavaFishingKey;
+    private static final KeyBinding.Category KEY_CATEGORY = KeyBinding.Category.create(Identifier.of("smc-qte", "general"));
 
     private boolean isRunning = false;
     private boolean showDebug = false;
     private boolean showSettings = false;
 
     // ===== 白名单验证 =====
-    private static final String WHITELIST_SERVER_URL = "https://wl.i7yee.uk/api/whitelist/check";
+    private static final String WHITELIST_SERVER_URL = "https://whalemc.com/api/whitelist/check";
     private static boolean isWhitelisted = false;
     private static boolean whitelistChecked = false;
     private static boolean whitelistCheckInProgress = false;
@@ -106,8 +110,40 @@ public class AutoFishClient implements ClientModInitializer {
     private static int rodsReplacedCount = 0;
     private static int lavaFishCount = 0;
 
-    // ===== 钻石追踪器 =====
-    private static final char DIAMOND_CHAR = '◆';
+    // ===== QTE tracking =====
+    private static final char DIAMOND_CHAR = '◈';
+    private static final char DIAMOND_SUIT_CHAR = '♦';
+    private static final char LEFT_ARROW_CHAR = '\u2190';
+    private static final char RIGHT_ARROW_CHAR = '\u2192';
+    private static final char UP_ARROW_CHAR = '\u2191';
+    private static final char DOWN_ARROW_CHAR = '\u2193';
+    private static final int CLICK_QTE_TICK_INTERVAL = 2;
+    private static final int ARROW_QTE_TICK_INTERVAL = 40;
+    private static final int JUMP_KEY_HOLD_TICKS = 3;
+    private static final int SNEAK_KEY_HOLD_TICKS = 10;
+
+    private enum QteMode {
+        NONE,
+        FISH_BAR,
+        CLICK_SPAM,
+        ARROW_SEQUENCE
+    }
+
+    private enum ClickQteAction {
+        LEFT,
+        RIGHT,
+        UNKNOWN
+    }
+
+    private QteMode activeQteMode = QteMode.NONE;
+    private int qteTickCounter = 0;
+    private int fishInitialProgress = 0;
+    private int fishLastProgress = 0;
+    private final Deque<Character> arrowQueue = new ArrayDeque<>();
+    private ClickQteAction clickQteAction = ClickQteAction.LEFT;
+    private int jumpKeyPressedTicks = 0;
+    private int sneakKeyPressedTicks = 0;
+
     private int lastDiamondCount = 0;
     private int currentDiamondCount = 0;
     private boolean qteActive = false;
@@ -172,35 +208,35 @@ public class AutoFishClient implements ClientModInitializer {
                 "key.smc-qte.toggle",
                 InputUtil.Type.KEYSYM,
                 GLFW.GLFW_KEY_P,
-                "category.smc-qte"
+                KEY_CATEGORY
         ));
 
         debugKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
                 "key.smc-qte.debug",
                 InputUtil.Type.KEYSYM,
                 GLFW.GLFW_KEY_O,
-                "category.smc-qte"
+                KEY_CATEGORY
         ));
 
         settingsKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
                 "key.smc-qte.settings",
                 InputUtil.Type.KEYSYM,
                 GLFW.GLFW_KEY_I,
-                "category.smc-qte"
+                KEY_CATEGORY
         ));
 
         toggleLuckPotionKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
                 "key.smc-qte.toggleLuckPotion",
                 InputUtil.Type.KEYSYM,
                 GLFW.GLFW_KEY_L,
-                "category.smc-qte"
+                KEY_CATEGORY
         ));
 
         toggleLavaFishingKey = KeyBindingHelper.registerKeyBinding(new KeyBinding(
                 "key.smc-qte.toggleLavaFishing",
                 InputUtil.Type.KEYSYM,
                 GLFW.GLFW_KEY_M,
-                "category.smc-qte"
+                KEY_CATEGORY
         ));
 
         HudRenderCallback.EVENT.register(this::renderDebugOverlay);
@@ -564,7 +600,6 @@ public class AutoFishClient implements ClientModInitializer {
     private void handleLavaFishing(MinecraftClient client) {
         if (client.player == null || client.world == null) return;
 
-        // 处理等待出杆状态（QTE完成后）
         if (actionState == ActionState.WAIT_SECOND_CLICK) {
             actionTimer--;
             statusText = "§e等待出杆: " + actionTimer;
@@ -574,13 +609,12 @@ public class AutoFishClient implements ClientModInitializer {
 
                 actionState = ActionState.COOLDOWN;
                 actionTimer = COOLDOWN_TICKS;
-                statusText = "§a已出杆!";
+                statusText = "§a已出杆";
                 resetLavaBobberTracking();
             }
             return;
         }
 
-        // 处理冷却状态
         if (actionState == ActionState.COOLDOWN) {
             actionTimer--;
             statusText = "§7冷却中: " + actionTimer;
@@ -590,7 +624,6 @@ public class AutoFishClient implements ClientModInitializer {
             return;
         }
 
-        // 检查是否需要重新抛竿
         if (lavaWaitingToRecast) {
             lavaRecastTimer--;
             double remainingSeconds = lavaRecastTimer / 20.0;
@@ -601,29 +634,23 @@ public class AutoFishClient implements ClientModInitializer {
                     doRightClick(client);
                     resetLavaBobberTracking();
                     lavaWaitingToRecast = false;
-                    statusText = "§a重新抛竿！";
+                    statusText = "§a重新抛竿";
                     client.player.sendMessage(Text.of("§a[岩浆钓鱼] 重新抛竿"), true);
                 }
             }
             return;
         }
 
-        // 获取当前钻石数
         String titleText = getCurrentTitleText(client);
         int diamondCount = countDiamonds(titleText);
-
-        // 更新钻石状态
         lastDiamondCount = currentDiamondCount;
         currentDiamondCount = diamondCount;
 
         boolean rodCast = isRodCast(client);
 
-        // ===== 岩浆QTE状态机处理 =====
         switch (lavaQteState) {
             case IDLE:
-                // 正常监测浮标状态
                 if (!rodCast) {
-                    // 没有抛竿，先抛竿
                     if (canRodAction()) {
                         doRightClick(client);
                         resetLavaBobberTracking();
@@ -633,33 +660,30 @@ public class AutoFishClient implements ClientModInitializer {
                     return;
                 }
 
-                // 检测浮标咬钩
                 if (detectLavaFishingBite(client)) {
-                    // 检测到咬钩，收杆触发QTE
                     doRightClick(client);
                     lavaQteState = LavaQteState.WAITING_FOR_QTE;
                     lavaQteWaitTimer = 0;
+                    resetQteModeState();
                     client.player.sendMessage(Text.of("§6[岩浆钓鱼] 检测到咬钩，收杆等待QTE..."), true);
                     statusText = "§6收杆！等待QTE出现...";
                 }
                 break;
 
             case WAITING_FOR_QTE:
-                // 已收杆，等待QTE（钻石）出现
                 lavaQteWaitTimer++;
 
-                if (diamondCount > 0) {
-                    // QTE出现了
+                if (isAnyQtePrompt(titleText)) {
+                    updateQteTrackingFromText(client, titleText);
                     lavaQteState = LavaQteState.QTE_ACTIVE;
-                    qteActive = true;
-                    statusText = "§eQTE出现! ◆×" + diamondCount;
-                    client.player.sendMessage(Text.of("§e[岩浆钓鱼] QTE出现: ◆×" + diamondCount), true);
+                    statusText = "§eQTE出现!";
+                    client.player.sendMessage(Text.of("§e[岩浆钓鱼] QTE出现"), true);
                 } else if (lavaQteWaitTimer >= lavaQteWaitTimeout) {
-                    // 超时没有出现QTE，可能是误判，重新抛竿
                     lavaQteState = LavaQteState.IDLE;
                     lavaWaitingToRecast = true;
                     lavaRecastTimer = lavaRecastDelay;
                     resetLavaBobberTracking();
+                    resetQteModeState();
                     statusText = "§cQTE超时，准备重新抛竿...";
                     client.player.sendMessage(Text.of("§c[岩浆钓鱼] QTE超时，重新抛竿"), true);
                 } else {
@@ -669,51 +693,41 @@ public class AutoFishClient implements ClientModInitializer {
                 break;
 
             case QTE_ACTIVE:
-                // QTE已激活，等待钻石减少
-                if (diamondCount > 0) {
-                    statusText = "§e等待QTE: ◆×" + diamondCount;
-
-                    // 检测钻石减少 -> 收杆
-                    if (lastDiamondCount > 0 && currentDiamondCount < lastDiamondCount) {
-                        long now = System.currentTimeMillis();
-                        if (now - lastClickTime > 300) {
-                            doRightClick(client);
-                            lastClickTime = now;
-
-                            client.player.sendMessage(Text.of("§a[QTE收杆!] 钻石: " + lastDiamondCount + " → " + currentDiamondCount), true);
-
-                            qteCount++;
-                            totalQteCount++;
-                            lavaFishCount++;
-
-                            // 完成QTE，准备出杆
-                            lavaQteState = LavaQteState.IDLE;
-                            resetDiamondState();
-                            resetLavaBobberTracking();
-
-                            actionState = ActionState.WAIT_SECOND_CLICK;
-                            actionTimer = SECOND_CLICK_DELAY;
-                            statusText = "§a收杆成功！等待出杆...";
-                        }
-                    }
-                } else {
-                    // 钻石消失了（QTE结束/超时）
+                if (titleText == null || titleText.isEmpty()) {
                     lavaQteState = LavaQteState.IDLE;
-                    resetDiamondState();
-
-                    // 准备重新抛竿
+                    resetQteModeState();
                     lavaWaitingToRecast = true;
                     lavaRecastTimer = lavaRecastDelay;
                     resetLavaBobberTracking();
-
                     statusText = "§eQTE结束，准备重新抛竿...";
-                    client.player.sendMessage(Text.of("§e[岩浆钓鱼] QTE结束，重新抛竿"), true);
+                    break;
+                }
+
+                updateQteTrackingFromText(client, titleText);
+                if (didQteSucceed(client, titleText)) {
+                    qteCount++;
+                    totalQteCount++;
+                    lavaFishCount++;
+
+                    lavaQteState = LavaQteState.IDLE;
+                    resetQteModeState();
+                    resetLavaBobberTracking();
+
+                    actionState = ActionState.WAIT_SECOND_CLICK;
+                    actionTimer = SECOND_CLICK_DELAY;
+                    statusText = "§a收杆成功！等待出杆...";
+                } else if (didQteFail(titleText)) {
+                    lavaQteState = LavaQteState.IDLE;
+                    resetQteModeState();
+                    lavaWaitingToRecast = true;
+                    lavaRecastTimer = lavaRecastDelay;
+                    resetLavaBobberTracking();
+                    statusText = "§cQTE失败，准备重新抛竿...";
                 }
                 break;
         }
     }
 
-    // ===== 岩浆钓鱼咬钩检测 =====
     private boolean detectLavaFishingBite(MinecraftClient client) {
         if (client.player == null) return false;
 
@@ -793,9 +807,8 @@ public class AutoFishClient implements ClientModInitializer {
     private void resetLavaQteState() {
         lavaQteState = LavaQteState.IDLE;
         lavaQteWaitTimer = 0;
+        resetQteModeState();
     }
-
-    // ===== 槽位切换辅助方法 =====
 
     private void switchToSlot(MinecraftClient client, int slot) {
         if (client.player == null || slot < 0 || slot > 8) return;
@@ -818,42 +831,324 @@ public class AutoFishClient implements ClientModInitializer {
         String titleText = getCurrentTitleText(client);
 
         if (titleText == null || titleText.isEmpty()) {
-            if (qteActive && currentDiamondCount > 0) {
+            if (qteActive) {
                 statusText = "§7QTE结束，等待下一次...";
-                resetDiamondState();
+                resetQteModeState();
             } else {
                 statusText = "§7等待QTE... (钓鱼中)";
             }
             return;
         }
 
-        int count = countDiamonds(titleText);
-        lastDiamondCount = currentDiamondCount;
-        currentDiamondCount = count;
+        updateQteTrackingFromText(client, titleText);
 
-        if (count > 0) {
-            qteActive = true;
-            statusText = "§e检测中: ◆×" + count;
+        if (didQteSucceed(client, titleText)) {
+            qteCount++;
+            totalQteCount++;
+
+            resetQteModeState();
+            actionState = ActionState.WAIT_SECOND_CLICK;
+            actionTimer = SECOND_CLICK_DELAY;
+            statusText = "§e等待出杆...";
+        } else if (didQteFail(titleText)) {
+            resetQteModeState();
+            statusText = "§cQTE失败，等待下一次...";
+        }
+    }
+
+    private void updateQteTrackingFromText(MinecraftClient client, String titleText) {
+        if (titleText == null) return;
+
+        String normalized = normalizeQteText(titleText);
+        if (normalized.isEmpty()) return;
+
+        lastDiamondCount = currentDiamondCount;
+        currentDiamondCount = countDiamonds(normalized);
+
+        if (!qteActive) {
+            beginQteMode(client, normalized);
         }
 
-        if (lastDiamondCount > 0 && currentDiamondCount < lastDiamondCount) {
-            long now = System.currentTimeMillis();
-            if (now - lastClickTime > 300) {
-                doRightClick(client);
-                lastClickTime = now;
+        if (!qteActive) {
+            return;
+        }
 
-                client.player.sendMessage(Text.of("§a[收杆!] 钻石: " + lastDiamondCount + " → " + currentDiamondCount), true);
+        switch (activeQteMode) {
+            case FISH_BAR:
+                handleFishBarQte(client, normalized);
+                break;
+            case CLICK_SPAM:
+                handleClickSpamQte(client);
+                break;
+            case ARROW_SEQUENCE:
+                handleArrowSequenceQte(client);
+                break;
+            case NONE:
+            default:
+                break;
+        }
+    }
 
-                qteCount++;
-                totalQteCount++;
-
-                resetDiamondState();
-
-                actionState = ActionState.WAIT_SECOND_CLICK;
-                actionTimer = SECOND_CLICK_DELAY;
-                statusText = "§e等待出杆...";
+    private void beginQteMode(MinecraftClient client, String normalizedText) {
+        if (hasArrowPrompt(normalizedText)) {
+            arrowQueue.clear();
+        clickQteAction = ClickQteAction.LEFT;
+            for (int i = 0; i < normalizedText.length(); i++) {
+                char c = normalizedText.charAt(i);
+                if (c == LEFT_ARROW_CHAR || c == RIGHT_ARROW_CHAR
+                        || c == UP_ARROW_CHAR || c == DOWN_ARROW_CHAR) {
+                    arrowQueue.add(c);
+                }
+            }
+            if (!arrowQueue.isEmpty()) {
+                activeQteMode = QteMode.ARROW_SEQUENCE;
+                qteActive = true;
+                qteTickCounter = 0;
+                statusText = "§e方向QTE: " + arrowQueue.size() + "步";
+                return;
             }
         }
+
+        if (isClickQtePrompt(normalizedText)) {
+            activeQteMode = QteMode.CLICK_SPAM;
+            qteActive = true;
+            qteTickCounter = 0;
+            updateClickQteActionFromPrompt(client);
+            statusText = clickQteAction == ClickQteAction.RIGHT ? "§e连点QTE(右键)..." : "§e连点QTE(左键)...";
+            return;
+        }
+
+        int symbolCount = countFishProgressSymbols(normalizedText);
+        if (symbolCount > 0) {
+            activeQteMode = QteMode.FISH_BAR;
+            qteActive = true;
+            fishInitialProgress = symbolCount;
+            fishLastProgress = symbolCount;
+            statusText = "§e鱼条QTE: " + symbolCount;
+        }
+    }
+
+    private void handleFishBarQte(MinecraftClient client, String normalizedText) {
+        int symbolCount = countFishProgressSymbols(normalizedText);
+        if (symbolCount <= 0) {
+            return;
+        }
+
+        fishLastProgress = symbolCount;
+        statusText = "§e鱼条QTE: " + symbolCount + " / " + fishInitialProgress;
+
+        if (symbolCount < fishInitialProgress) {
+            long now = System.currentTimeMillis();
+            if (now - lastClickTime > 250) {
+                doRightClick(client);
+                lastClickTime = now;
+                statusText = "§a[收杆] 进度减少: " + fishInitialProgress + " -> " + symbolCount;
+            }
+        }
+    }
+
+    private void handleClickSpamQte(MinecraftClient client) {
+        updateClickQteActionFromPrompt(client);
+        qteTickCounter++;
+        if (qteTickCounter >= CLICK_QTE_TICK_INTERVAL) {
+            qteTickCounter = 0;
+            if (clickQteAction == ClickQteAction.RIGHT) {
+                doRightClick(client);
+            } else {
+                doLeftClick(client);
+            }
+        }
+    }
+
+    private void handleArrowSequenceQte(MinecraftClient client) {
+        // 每 tick 递减跳跃/蹲下按键的持续时间，到时自动释放
+        if (jumpKeyPressedTicks > 0) {
+            jumpKeyPressedTicks--;
+            if (jumpKeyPressedTicks == 0) {
+                client.options.jumpKey.setPressed(false);
+            }
+        }
+        if (sneakKeyPressedTicks > 0) {
+            sneakKeyPressedTicks--;
+            if (sneakKeyPressedTicks == 0) {
+                client.options.sneakKey.setPressed(false);
+            }
+        }
+
+        qteTickCounter++;
+        if (qteTickCounter < ARROW_QTE_TICK_INTERVAL) {
+            return;
+        }
+        qteTickCounter = 0;
+
+        if (arrowQueue.isEmpty()) {
+            return;
+        }
+
+        char arrow = arrowQueue.poll();
+        if (arrow == LEFT_ARROW_CHAR) {
+            doLeftClick(client);
+        } else if (arrow == RIGHT_ARROW_CHAR) {
+            doRightClick(client);
+        } else if (arrow == UP_ARROW_CHAR) {
+            doJump(client);
+        } else if (arrow == DOWN_ARROW_CHAR) {
+            doSneak(client);
+        }
+
+        statusText = "§e方向QTE剩余: " + arrowQueue.size();
+    }
+
+    private void doJump(MinecraftClient client) {
+        if (client == null || client.player == null) return;
+        client.options.jumpKey.setPressed(true);
+        jumpKeyPressedTicks = JUMP_KEY_HOLD_TICKS;
+    }
+
+    private void doSneak(MinecraftClient client) {
+        if (client == null || client.player == null) return;
+        client.options.sneakKey.setPressed(true);
+        sneakKeyPressedTicks = SNEAK_KEY_HOLD_TICKS;
+    }
+
+    private void releaseMovementKeys(MinecraftClient client) {
+        if (client == null) return;
+        if (jumpKeyPressedTicks > 0) {
+            client.options.jumpKey.setPressed(false);
+            jumpKeyPressedTicks = 0;
+        }
+        if (sneakKeyPressedTicks > 0) {
+            client.options.sneakKey.setPressed(false);
+            sneakKeyPressedTicks = 0;
+        }
+    }
+
+    private boolean didQteSucceed(MinecraftClient client, String text) {
+        String normalized = normalizeQteText(text);
+        if (normalized.isEmpty()) {
+            return false;
+        }
+
+        switch (activeQteMode) {
+            case FISH_BAR:
+                return fishLastProgress > 0 && fishLastProgress < fishInitialProgress;
+            case CLICK_SPAM:
+                if (isQteSuccessText(normalized)) {
+                    doRightClick(client);
+                    return true;
+                }
+                return false;
+            case ARROW_SEQUENCE:
+                if (arrowQueue.isEmpty() && qteActive) {
+                    doRightClick(client);
+                    return true;
+                }
+                return false;
+            case NONE:
+            default:
+                return false;
+        }
+    }
+
+    private boolean didQteFail(String text) {
+        if (!qteActive) {
+            return false;
+        }
+        return isQteFailText(normalizeQteText(text));
+    }
+
+    private boolean isAnyQtePrompt(String text) {
+        if (text == null || text.isEmpty()) return false;
+        String normalized = normalizeQteText(text);
+        return hasArrowPrompt(normalized) || isClickQtePrompt(normalized) || countFishProgressSymbols(normalized) > 0;
+    }
+
+    private String normalizeQteText(String text) {
+        if (text == null) return "";
+        return text.replaceAll("\\s+", "");
+    }
+
+    private boolean hasArrowPrompt(String text) {
+        return text.indexOf(LEFT_ARROW_CHAR) >= 0 || text.indexOf(RIGHT_ARROW_CHAR) >= 0
+                || text.indexOf(UP_ARROW_CHAR) >= 0 || text.indexOf(DOWN_ARROW_CHAR) >= 0;
+    }
+
+    private boolean isClickQtePrompt(String text) {
+        return text.contains("需要点击次数") || (text.contains("点击") && text.contains("次"));
+    }
+
+    private void updateClickQteActionFromPrompt(MinecraftClient client) {
+        ClickQteAction action = detectClickQteAction(getCurrentSubtitleText(client));
+        if (action == ClickQteAction.UNKNOWN) {
+            action = detectClickQteAction(getCurrentTitleText(client));
+        }
+        if (action != ClickQteAction.UNKNOWN) {
+            clickQteAction = action;
+        }
+    }
+
+    private ClickQteAction detectClickQteAction(String text) {
+        String normalized = normalizeQteText(text).toLowerCase();
+        if (normalized.isEmpty()) {
+            return ClickQteAction.UNKNOWN;
+        }
+        if (normalized.contains("\\u53f3") || normalized.contains("\\u53f3\\u952e") || normalized.contains("right") || normalized.contains("mouse2") || normalized.contains("rmb")) {
+            return ClickQteAction.RIGHT;
+        }
+        if (normalized.contains("\\u5de6") || normalized.contains("\\u5de6\\u952e") || normalized.contains("left") || normalized.contains("mouse1") || normalized.contains("lmb")) {
+            return ClickQteAction.LEFT;
+        }
+        return ClickQteAction.UNKNOWN;
+    }
+
+    private boolean isQteSuccessText(String text) {
+        return text.contains("成功") || text.contains("完成") || text.contains("收杆") || text.contains("钓上") || text.contains("钓到");
+    }
+
+    private boolean isQteFailText(String text) {
+        return text.contains("再试") || text.contains("遗憾") || text.contains("失败") || text.contains("超时") || text.contains("结束");
+    }
+    private int countFishProgressSymbols(String text) {
+        if (text == null || text.isEmpty()) return 0;
+        int count = 0;
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (c == '◈' || c == '◆' || c == '♦' || c == '◇' || c == '●' || c == '○') {
+                count++;
+            }
+        }
+        return count;
+    }
+    private void resetQteModeState() {
+        lastDiamondCount = 0;
+        currentDiamondCount = 0;
+        qteActive = false;
+        activeQteMode = QteMode.NONE;
+        qteTickCounter = 0;
+        fishInitialProgress = 0;
+        fishLastProgress = 0;
+        arrowQueue.clear();
+        clickQteAction = ClickQteAction.LEFT;
+        releaseMovementKeys(MinecraftClient.getInstance());
+    }
+
+    private String getCurrentSubtitleText(MinecraftClient client) {
+        if (client.inGameHud == null) return null;
+
+        try {
+            InGameHudAccessor accessor = (InGameHudAccessor) client.inGameHud;
+            Text subtitle = accessor.getSubtitle();
+            if (subtitle != null) {
+                String subtitleStr = subtitle.getString();
+                if (subtitleStr != null && !subtitleStr.isEmpty()) {
+                    return subtitleStr;
+                }
+            }
+        } catch (Exception e) {
+            // 忽略
+        }
+
+        return null;
     }
 
     private String getCurrentTitleText(MinecraftClient client) {
@@ -883,22 +1178,19 @@ public class AutoFishClient implements ClientModInitializer {
 
         return null;
     }
-
     private int countDiamonds(String text) {
         if (text == null) return 0;
         int count = 0;
         for (int i = 0; i < text.length(); i++) {
-            if (text.charAt(i) == DIAMOND_CHAR) {
+            char c = text.charAt(i);
+            if (c == DIAMOND_CHAR || c == '◈' || c == DIAMOND_SUIT_CHAR) {
                 count++;
             }
         }
         return count;
     }
-
     private void resetDiamondState() {
-        lastDiamondCount = 0;
-        currentDiamondCount = 0;
-        qteActive = false;
+        resetQteModeState();
     }
 
     // ===== 鱼竿状态检测 =====
@@ -1102,18 +1394,18 @@ public class AutoFishClient implements ClientModInitializer {
         long now = System.currentTimeMillis();
         if (now - lastKeyPressTime < 150) return;
 
-        long windowHandle = client.getWindow().getHandle();
+        var window = client.getWindow();
 
-        if (InputUtil.isKeyPressed(windowHandle, GLFW.GLFW_KEY_UP)) {
+        if (InputUtil.isKeyPressed(window, GLFW.GLFW_KEY_UP)) {
             selectedOption = (selectedOption - 1 + TOTAL_OPTIONS) % TOTAL_OPTIONS;
             lastKeyPressTime = now;
         }
-        if (InputUtil.isKeyPressed(windowHandle, GLFW.GLFW_KEY_DOWN)) {
+        if (InputUtil.isKeyPressed(window, GLFW.GLFW_KEY_DOWN)) {
             selectedOption = (selectedOption + 1) % TOTAL_OPTIONS;
             lastKeyPressTime = now;
         }
 
-        if (InputUtil.isKeyPressed(windowHandle, GLFW.GLFW_KEY_ENTER)) {
+        if (InputUtil.isKeyPressed(window, GLFW.GLFW_KEY_ENTER)) {
             switch (selectedOption) {
                 case 0 -> {
                     onlyDaytime = !onlyDaytime;
@@ -1144,78 +1436,77 @@ public class AutoFishClient implements ClientModInitializer {
         }
 
         if (selectedOption == 5) {
-            if (InputUtil.isKeyPressed(windowHandle, GLFW.GLFW_KEY_LEFT)) {
+            if (InputUtil.isKeyPressed(window, GLFW.GLFW_KEY_LEFT)) {
                 durabilityThreshold = Math.max(1, durabilityThreshold - 5);
                 lastKeyPressTime = now;
             }
-            if (InputUtil.isKeyPressed(windowHandle, GLFW.GLFW_KEY_RIGHT)) {
+            if (InputUtil.isKeyPressed(window, GLFW.GLFW_KEY_RIGHT)) {
                 durabilityThreshold = Math.min(100, durabilityThreshold + 5);
                 lastKeyPressTime = now;
             }
         }
 
         if (selectedOption == 8) {
-            if (InputUtil.isKeyPressed(windowHandle, GLFW.GLFW_KEY_LEFT)) {
+            if (InputUtil.isKeyPressed(window, GLFW.GLFW_KEY_LEFT)) {
                 luckPotionThreshold = Math.max(5, luckPotionThreshold - 5);
                 lastKeyPressTime = now;
             }
-            if (InputUtil.isKeyPressed(windowHandle, GLFW.GLFW_KEY_RIGHT)) {
+            if (InputUtil.isKeyPressed(window, GLFW.GLFW_KEY_RIGHT)) {
                 luckPotionThreshold = Math.min(120, luckPotionThreshold + 5);
                 lastKeyPressTime = now;
             }
         }
 
         if (selectedOption == 9) {
-            if (InputUtil.isKeyPressed(windowHandle, GLFW.GLFW_KEY_LEFT)) {
+            if (InputUtil.isKeyPressed(window, GLFW.GLFW_KEY_LEFT)) {
                 itemSwitchDelay = Math.max(0, itemSwitchDelay - 1);
                 lastKeyPressTime = now;
             }
-            if (InputUtil.isKeyPressed(windowHandle, GLFW.GLFW_KEY_RIGHT)) {
+            if (InputUtil.isKeyPressed(window, GLFW.GLFW_KEY_RIGHT)) {
                 itemSwitchDelay = Math.min(20, itemSwitchDelay + 1);
                 lastKeyPressTime = now;
             }
         }
 
         if (selectedOption == 11) {
-            if (InputUtil.isKeyPressed(windowHandle, GLFW.GLFW_KEY_LEFT)) {
+            if (InputUtil.isKeyPressed(window, GLFW.GLFW_KEY_LEFT)) {
                 lavaSettleTime = Math.max(20, lavaSettleTime - 10);
                 lastKeyPressTime = now;
             }
-            if (InputUtil.isKeyPressed(windowHandle, GLFW.GLFW_KEY_RIGHT)) {
+            if (InputUtil.isKeyPressed(window, GLFW.GLFW_KEY_RIGHT)) {
                 lavaSettleTime = Math.min(200, lavaSettleTime + 10);
                 lastKeyPressTime = now;
             }
         }
 
         if (selectedOption == 12) {
-            if (InputUtil.isKeyPressed(windowHandle, GLFW.GLFW_KEY_LEFT)) {
+            if (InputUtil.isKeyPressed(window, GLFW.GLFW_KEY_LEFT)) {
                 lavaRecastDelay = Math.max(5, lavaRecastDelay - 5);
                 lastKeyPressTime = now;
             }
-            if (InputUtil.isKeyPressed(windowHandle, GLFW.GLFW_KEY_RIGHT)) {
+            if (InputUtil.isKeyPressed(window, GLFW.GLFW_KEY_RIGHT)) {
                 lavaRecastDelay = Math.min(100, lavaRecastDelay + 5);
                 lastKeyPressTime = now;
             }
         }
 
         if (selectedOption == 13) {
-            if (InputUtil.isKeyPressed(windowHandle, GLFW.GLFW_KEY_LEFT)) {
+            if (InputUtil.isKeyPressed(window, GLFW.GLFW_KEY_LEFT)) {
                 lavaBobberRiseThreshold = Math.max(0.001, lavaBobberRiseThreshold - 0.005);
                 lastKeyPressTime = now;
             }
-            if (InputUtil.isKeyPressed(windowHandle, GLFW.GLFW_KEY_RIGHT)) {
+            if (InputUtil.isKeyPressed(window, GLFW.GLFW_KEY_RIGHT)) {
                 lavaBobberRiseThreshold = Math.min(0.1, lavaBobberRiseThreshold + 0.005);
                 lastKeyPressTime = now;
             }
         }
 
-        // 新增：QTE检测超时时间调整
         if (selectedOption == 14) {
-            if (InputUtil.isKeyPressed(windowHandle, GLFW.GLFW_KEY_LEFT)) {
+            if (InputUtil.isKeyPressed(window, GLFW.GLFW_KEY_LEFT)) {
                 lavaQteWaitTimeout = Math.max(20, lavaQteWaitTimeout - 10);
                 lastKeyPressTime = now;
             }
-            if (InputUtil.isKeyPressed(windowHandle, GLFW.GLFW_KEY_RIGHT)) {
+            if (InputUtil.isKeyPressed(window, GLFW.GLFW_KEY_RIGHT)) {
                 lavaQteWaitTimeout = Math.min(200, lavaQteWaitTimeout + 10);
                 lastKeyPressTime = now;
             }
@@ -1235,13 +1526,28 @@ public class AutoFishClient implements ClientModInitializer {
     }
 
     private void doRightClick(MinecraftClient client) {
+        if (client == null) return;
         if (client.interactionManager != null && client.player != null) {
             client.interactionManager.interactItem(client.player, Hand.MAIN_HAND);
             client.player.swingHand(Hand.MAIN_HAND);
         }
     }
 
-    // ===== 幸运效果检测 =====
+    private void doLeftClick(MinecraftClient client) {
+        if (client == null) return;
+        if (client.interactionManager != null && client.player != null) {
+            try {
+                java.lang.reflect.Method m = MinecraftClient.class.getDeclaredMethod("doAttack");
+                m.setAccessible(true);
+                m.invoke(client);
+            } catch (Exception ignored) {
+                // fallback: 直接触发攻击键，尽量兼容不同映射
+                client.options.attackKey.setPressed(true);
+                client.options.attackKey.setPressed(false);
+            }
+            client.player.swingHand(Hand.MAIN_HAND);
+        }
+    }
 
     private boolean hasLuckEffect(MinecraftClient client) {
         if (client.player == null) return false;
@@ -1648,7 +1954,7 @@ public class AutoFishClient implements ClientModInitializer {
                     lavaStatusStr = "§6等待QTE " + String.format("%.1fs", remaining);
                     break;
                 case QTE_ACTIVE:
-                    lavaStatusStr = "§eQTE中 ◆×" + currentDiamondCount;
+                    lavaStatusStr = "§eQTE中 ◈×" + currentDiamondCount;
                     break;
             }
         }
@@ -1694,3 +2000,5 @@ public class AutoFishClient implements ClientModInitializer {
         }
     }
 }
+
+
